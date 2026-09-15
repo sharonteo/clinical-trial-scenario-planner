@@ -1,7 +1,6 @@
 import math
 import time
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -9,7 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-st.set_page_config(page_title="TrialPath", page_icon="◌", layout="wide")
+st.set_page_config(page_title="StudyRunway", page_icon="◌", layout="wide")
 
 st.markdown("""
 <style>
@@ -49,6 +48,7 @@ class Inputs:
     screened_per_site: float
     screen_fail: float
     dropout: float
+    followup_months: int
     startup_cost: float
     patient_cost: float
     fixed_monthly: float
@@ -56,29 +56,85 @@ class Inputs:
     target_months: int
 
 
+def activation_schedule(sites: int, activation_months: int) -> np.ndarray:
+    """Planned activation month for each site."""
+    return np.linspace(1, max(1, activation_months), sites).round().astype(int)
+
+
 def simulate(x: Inputs, horizon: int = 60) -> pd.DataFrame:
-    activation = np.linspace(1, max(1, x.activation_months), x.sites).round().astype(int)
+    """Create a deterministic expected-value enrollment and cost forecast.
+
+    Participants reach the completion endpoint only after the follow-up period.
+    Recruitment stops once the enrolled pipeline is sufficient to produce the
+    requested number of expected completers after dropout.
+    """
+    activation = activation_schedule(x.sites, x.activation_months)
+    activated = np.zeros(x.sites, dtype=bool)
+    enrolled_cohorts = {}
+    required_enrolled = x.target / max(1 - x.dropout, 1e-9)
     rows, screened, enrolled, completed, spend = [], 0.0, 0.0, 0.0, 0.0
+
     for month in range(1, horizon + 1):
-        active = int((activation <= month).sum())
-        new_sites = int((activation == month).sum())
-        new_screened = active * x.screened_per_site if completed < x.target else 0
-        new_enrolled = new_screened * (1 - x.screen_fail)
-        new_completed = new_enrolled * (1 - x.dropout)
-        if completed + new_completed > x.target:
-            scale = (x.target - completed) / max(new_completed, 1e-9)
-            new_screened *= max(scale, 0)
-            new_enrolled *= max(scale, 0)
-            new_completed = max(x.target - completed, 0)
+        was_complete = completed >= x.target - 1e-9
+        recruiting = enrolled < required_enrolled - 1e-9 and not was_complete
+
+        newly_activated = (activation == month) & (~activated) if recruiting else np.zeros(x.sites, dtype=bool)
+        activated |= newly_activated
+        new_sites = int(newly_activated.sum())
+        active = int(activated.sum())
+
+        new_screened = active * x.screened_per_site if recruiting else 0.0
+        potential_enrolled = new_screened * (1 - x.screen_fail)
+        new_enrolled = min(potential_enrolled, max(required_enrolled - enrolled, 0.0))
+        if potential_enrolled > 0:
+            new_screened *= new_enrolled / potential_enrolled
+        enrolled_cohorts[month] = new_enrolled
+
+        completing_cohort_month = month - x.followup_months
+        new_completed = enrolled_cohorts.get(completing_cohort_month, 0.0) * (1 - x.dropout)
+        new_completed = min(new_completed, max(x.target - completed, 0.0))
+
         screened += new_screened
         enrolled += new_enrolled
         completed += new_completed
-        monthly_spend = new_sites * x.startup_cost + new_enrolled * x.patient_cost + x.fixed_monthly
+        program_active = not was_complete
+        monthly_spend = (
+            new_sites * x.startup_cost
+            + new_enrolled * x.patient_cost
+            + (x.fixed_monthly if program_active else 0.0)
+        )
         spend += monthly_spend
         rows.append(dict(month=month, active_sites=active, screened=screened, enrolled=enrolled,
-                         completed=completed, monthly_spend=monthly_spend, cumulative_spend=spend,
+                         completed=completed, new_screened=new_screened, new_enrolled=new_enrolled,
+                         new_completed=new_completed, monthly_spend=monthly_spend, cumulative_spend=spend,
                          cash_remaining=x.starting_cash-spend))
     return pd.DataFrame(rows)
+
+
+def active_site_months(sites: int, activation_months: int, through_month: int) -> int:
+    """Exact recruitment capacity contributed by the planned site ramp."""
+    if through_month < 1:
+        return 0
+    activation = activation_schedule(sites, activation_months)
+    return int(np.maximum(through_month - activation + 1, 0).sum())
+
+
+def minimum_screening_rate(x: Inputs) -> float:
+    recruitment_deadline = x.target_months - x.followup_months
+    capacity = active_site_months(x.sites, x.activation_months, recruitment_deadline)
+    net_yield = (1 - x.screen_fail) * (1 - x.dropout)
+    return x.target / (capacity * net_yield) if capacity > 0 and net_yield > 0 else math.inf
+
+
+def minimum_sites(x: Inputs, maximum: int = 500) -> int | None:
+    recruitment_deadline = x.target_months - x.followup_months
+    net_yield = (1 - x.screen_fail) * (1 - x.dropout)
+    for candidate in range(1, maximum + 1):
+        capacity = active_site_months(candidate, x.activation_months, recruitment_deadline)
+        expected_completers = capacity * x.screened_per_site * net_yield
+        if expected_completers >= x.target - 1e-9:
+            return candidate
+    return None
 
 
 def money(v):
@@ -94,14 +150,15 @@ with st.sidebar:
     screened_rate = st.slider("Screened per active site / month", 0.5, 8.0, 3.0, 0.25)
     screen_fail = st.slider("Screen failure", 0, 70, 30) / 100
     dropout = st.slider("Participant dropout", 0, 40, 12) / 100
+    followup_months = st.slider("Months from enrollment to endpoint", 1, 12, 3)
     st.markdown("### Funding assumptions")
     startup_cost = st.number_input("Startup cost per site", 10_000, 500_000, 125_000, 5_000)
     patient_cost = st.number_input("Cost per enrolled participant", 5_000, 150_000, 35_000, 1_000)
     fixed_monthly = st.number_input("Fixed monthly program cost", 50_000, 2_000_000, 350_000, 25_000)
     starting_cash = st.number_input("Funding available", 1_000_000, 100_000_000, 25_000_000, 500_000)
-    target_months = st.slider("Desired enrollment deadline (months)", 6, 48, 24)
+    target_months = st.slider("Desired completion deadline (months)", 6, 48, 24)
 
-x = Inputs(target, sites, activation_months, screened_rate, screen_fail, dropout,
+x = Inputs(target, sites, activation_months, screened_rate, screen_fail, dropout, followup_months,
            startup_cost, patient_cost, fixed_monthly, starting_cash, target_months)
 df = simulate(x)
 complete_rows = df[df.completed >= x.target - 0.01]
@@ -111,28 +168,28 @@ total_cost = float(df.iloc[completion_idx].cumulative_spend)
 funding_gap = max(0, total_cost - x.starting_cash)
 runout = df[df.cash_remaining < 0]
 runout_month = int(runout.month.iloc[0]) if not runout.empty else None
-net_completion_rate = (1-x.screen_fail)*(1-x.dropout)
-effective_site_months = max(x.target_months - x.activation_months / 2, 1)
-needed_rate = x.target / max(x.sites * effective_site_months * net_completion_rate, .01)
+needed_rate = minimum_screening_rate(x)
+needed_sites = minimum_sites(x)
 
 st.markdown("""
-<div class="hero"><div class="eyebrow">TrialPath · Scenario Intelligence</div>
-<h1>Can your clinical trial finish on time—and within budget?</h1>
-<p>Explore how site activation, participant recruitment, screening failures and dropouts shape enrollment timelines and funding requirements.</p></div>
+<div class="hero">
+<div class="eyebrow">StudyRunway · Clinical Trial Scenario Planner</div>
+<h1>Can your clinical trial reach its participant target—on time and within budget?</h1>
+<p>Explore how site activation, recruitment, screening failures, follow-up and dropouts shape participant timelines and funding requirements.</p></div>
 """, unsafe_allow_html=True)
 
 cols = st.columns(4)
 cards = [
-    ("Enrollment complete", f"Month {completion_month}" if completion_month else "60+ months", f"Target: month {x.target_months}"),
-    ("Estimated cost", money(total_cost), "Through enrollment completion"),
+    ("Participant target reached", f"Month {completion_month}" if completion_month else "60+ months", f"Deadline: month {x.target_months}"),
+    ("Estimated cost", money(total_cost), "Through participant completion" if completion_month else "Through month 60"),
     ("Funding gap", money(funding_gap), "Additional capital indicated" if funding_gap else "Plan remains within funding"),
-    ("Cash runway", f"Month {runout_month}" if runout_month else "Beyond plan", "First projected negative balance" if runout_month else "Funding covers enrollment"),
+    ("Cash runway", f"Month {runout_month}" if runout_month else "Beyond completion", "First projected negative balance" if runout_month else "Funding covers completion"),
 ]
 for col, (label,value,sub) in zip(cols,cards):
     col.markdown(f'<div class="metric"><div class="label">{label}</div><div class="value">{value}</div><div class="sub">{sub}</div></div>', unsafe_allow_html=True)
 
 st.markdown("## Explore the forecast")
-tab1, tab2, tab3 = st.tabs(["Forecast", "Run simulation", "Meet the target"])
+tab1, tab2, tab3 = st.tabs(["Forecast", "Monthly progression", "Meet the target"])
 
 with tab1:
     left, right = st.columns([1.55,1])
@@ -140,7 +197,7 @@ with tab1:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.month, y=df.completed, name="Completed", fill="tozeroy", line=dict(color="#1f847f",width=3), fillcolor="rgba(31,132,127,.14)"))
         fig.add_trace(go.Scatter(x=df.month, y=df.enrolled, name="Enrolled", line=dict(color="#e78665",width=2,dash="dot")))
-        fig.add_hline(y=x.target, line_dash="dash", line_color="#142536", annotation_text="Enrollment target")
+        fig.add_hline(y=x.target, line_dash="dash", line_color="#142536", annotation_text="Participant target")
         fig.add_vline(x=x.target_months, line_dash="dot", line_color="#9aa1a6", annotation_text="Desired deadline")
         fig.update_layout(title="Participant forecast", xaxis_title="Month", yaxis_title="Participants", height=410,
                           margin=dict(l=20,r=20,t=60,b=20),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(255,255,255,.55)",legend_orientation="h")
@@ -157,7 +214,7 @@ with tab2:
     st.caption("Watch the operating plan unfold month by month.")
     speed = st.select_slider("Playback speed", options=["Slow","Normal","Fast"], value="Normal")
     delay = {"Slow":.45,"Normal":.22,"Fast":.08}[speed]
-    run = st.button("▶ Run simulation", type="primary")
+    run = st.button("▶ Play forecast", type="primary")
     stage = st.empty()
     months_to_show = min(completion_month or 36, 36)
     def render_month(m):
@@ -185,13 +242,19 @@ with tab2:
 
 with tab3:
     st.markdown("### What must be true to hit the deadline?")
-    st.markdown(f"To complete **{x.target:,} participants by month {x.target_months}** with the current site plan:")
+    st.markdown(f"To reach **{x.target:,} completed participants by month {x.target_months}** with the current assumptions:")
     a,b,c=st.columns(3)
-    a.metric("Minimum screening rate", f"{needed_rate:.1f}", "per active site / month")
-    needed_sites = math.ceil(x.target / max(x.screened_per_site*effective_site_months*net_completion_rate,.01))
-    b.metric("Sites required", f"{needed_sites}", f"{needed_sites-x.sites:+d} vs current plan")
-    budget_needed = float(df[df.month<=x.target_months].cumulative_spend.iloc[-1])
-    c.metric("Funding through deadline", money(budget_needed), "Based on current cost assumptions")
+    a.metric("Minimum screening rate", f"{needed_rate:.1f}" if math.isfinite(needed_rate) else "Not feasible", "per active site / month")
+    b.metric("Sites required", f"{needed_sites}" if needed_sites else "500+", f"{needed_sites-x.sites:+d} vs current plan" if needed_sites else "Outside model range")
+    if math.isfinite(needed_rate):
+        recovery = replace(x, screened_per_site=max(x.screened_per_site, needed_rate))
+        recovery_df = simulate(recovery, horizon=max(60, x.target_months + x.followup_months + 12))
+        recovery_complete = recovery_df[recovery_df.completed >= x.target - 0.01]
+        recovery_idx = int(recovery_complete.index[0]) if not recovery_complete.empty else len(recovery_df) - 1
+        budget_needed = float(recovery_df.iloc[recovery_idx].cumulative_spend)
+        c.metric("Funding needed", money(budget_needed), "At the required screening rate")
+    else:
+        c.metric("Funding needed", "Not estimable", "Deadline is shorter than follow-up")
     if completion_month and completion_month <= x.target_months:
         st.success(f"Current assumptions meet the deadline with approximately {x.target_months-completion_month} month(s) of schedule margin.")
     else:
@@ -199,4 +262,5 @@ with tab3:
         st.warning(f"Current assumptions miss the desired deadline by {late} month(s). Increase recruitment capacity, activate sites faster, or revisit the target.")
     st.markdown('<div class="note"><b>Decision insight:</b> This is a planning model, not a clinical or financial forecast. Replace illustrative assumptions with validated inputs from clinical operations, finance, regulatory and manufacturing teams.</div>',unsafe_allow_html=True)
 
-st.markdown("""<div class="footer"><b>TrialPath</b> · Generic demonstration using fictional assumptions. Not affiliated with any sponsor, medicine or clinical study. Not medical, regulatory or investment advice.</div>""",unsafe_allow_html=True)
+st.markdown("""<div class="footer"><b>StudyRunway</b> · Clinical Trial Scenario Planner · Generic demonstration using fictional assumptions. Not affiliated with any sponsor, medicine or clinical study. Not medical, regulatory or investment advice.</div>""",unsafe_allow_html=True)
+
