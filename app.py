@@ -1,7 +1,6 @@
 import json
 import math
 import os
-import time
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -493,9 +492,6 @@ total_cost = float(df.iloc[completion_idx].cumulative_spend)
 funding_gap = max(0, total_cost - x.starting_cash)
 runout = df[df.cash_remaining < 0]
 runout_month = int(runout.month.iloc[0]) if not runout.empty else None
-needed_rate = minimum_screening_rate(x)
-needed_sites = minimum_sites(x)
-
 st.markdown("""
 <div class="hero">
 <div class="eyebrow">StudyRunway · Clinical Trial Scenario Planner</div>
@@ -513,83 +509,26 @@ cards = [
 for col, (label,value,sub) in zip(cols,cards):
     col.markdown(f'<div class="metric"><div class="label">{label}</div><div class="value">{value}</div><div class="sub">{sub}</div></div>', unsafe_allow_html=True)
 
-st.markdown("## Explore the forecast")
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Forecast", "Monthly progression", "Meet the target", "Clinical Trial Rescue Agent"]
-)
+st.markdown("## Trial decision support")
+tab1, tab2 = st.tabs(["Trial Outlook", "AI Rescue Agent"])
 
 with tab1:
-    left, right = st.columns([1.55,1])
-    with left:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.month, y=df.completed, name="Completed", fill="tozeroy", line=dict(color="#1f847f",width=3), fillcolor="rgba(31,132,127,.14)"))
-        fig.add_trace(go.Scatter(x=df.month, y=df.enrolled, name="Enrolled", line=dict(color="#e78665",width=2,dash="dot")))
-        fig.add_hline(y=x.target, line_dash="dash", line_color="#142536", annotation_text="Participant target")
-        fig.add_vline(x=x.target_months, line_dash="dot", line_color="#9aa1a6", annotation_text="Desired deadline")
-        fig.update_layout(title="Participant forecast", xaxis_title="Month", yaxis_title="Participants", height=410,
-                          margin=dict(l=20,r=20,t=60,b=20),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(255,255,255,.55)",legend_orientation="h")
-        st.plotly_chart(fig, width="stretch")
-    with right:
-        cash = go.Figure()
-        cash.add_trace(go.Scatter(x=df.month, y=df.cash_remaining/1e6, fill="tozeroy", line=dict(color="#244e65",width=3), fillcolor="rgba(36,78,101,.14)"))
-        cash.add_hline(y=0,line_color="#e78665",line_dash="dash")
-        cash.update_layout(title="Funding runway", xaxis_title="Month", yaxis_title="$ millions remaining", height=410,
-                           margin=dict(l=20,r=20,t=60,b=20),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(255,255,255,.55)",showlegend=False)
-        st.plotly_chart(cash, width="stretch")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.month, y=df.completed, name="Completed", fill="tozeroy", line=dict(color="#1f847f",width=3), fillcolor="rgba(31,132,127,.14)"))
+    fig.add_trace(go.Scatter(x=df.month, y=df.enrolled, name="Enrolled", line=dict(color="#e78665",width=2,dash="dot")))
+    fig.add_hline(y=x.target, line_dash="dash", line_color="#142536", annotation_text="Participant target")
+    fig.add_vline(x=x.target_months, line_dash="dot", line_color="#9aa1a6", annotation_text="Desired deadline")
+    fig.update_layout(title="Participant forecast", xaxis_title="Month", yaxis_title="Participants", height=430,
+                      margin=dict(l=20,r=20,t=60,b=20),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(255,255,255,.55)",legend_orientation="h")
+    st.plotly_chart(fig, width="stretch")
+    if completion_month and completion_month <= x.target_months:
+        st.success(f"Projected completion is month {completion_month}, providing {x.target_months-completion_month} month(s) of schedule margin.")
+    else:
+        late = completion_month - x.target_months if completion_month else f"more than {60-x.target_months}"
+        st.warning(f"Projected completion is month {completion_month or '60+'} — {late} month(s) behind the desired deadline.")
+    st.markdown('<div class="note"><b>Planning note:</b> Results use fictional assumptions. Replace them with validated clinical-operations and finance inputs before making decisions.</div>', unsafe_allow_html=True)
 
 with tab2:
-    st.caption("Watch the operating plan unfold month by month.")
-    speed = st.select_slider("Playback speed", options=["Slow","Normal","Fast"], value="Normal")
-    delay = {"Slow":.45,"Normal":.22,"Fast":.08}[speed]
-    run = st.button("▶ Play forecast", type="primary")
-    stage = st.empty()
-    months_to_show = min(completion_month or 36, 36)
-    def render_month(m):
-        r=df.iloc[m-1]
-        health = "complete" if r.completed >= x.target else ("warning" if r.cash_remaining < 0 else "")
-        status = "Target reached" if r.completed >= x.target else ("Funding exhausted" if r.cash_remaining < 0 else "Recruiting")
-        stage.markdown(f"""
-        <div class="metric" style="padding:1.4rem">
-          <span class="status {health}">{status}</span>
-          <h2 style="margin:.7rem 0">Month {m}</h2>
-          <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:1rem">
-           <div><small>ACTIVE SITES</small><h3>{int(r.active_sites)} / {x.sites}</h3></div>
-           <div><small>SCREENED</small><h3>{int(r.screened)}</h3></div>
-           <div><small>ENROLLED</small><h3>{int(r.enrolled)}</h3></div>
-           <div><small>COMPLETED</small><h3>{int(r.completed)} / {x.target}</h3></div>
-           <div><small>CASH REMAINING</small><h3>{money(r.cash_remaining)}</h3></div>
-          </div>
-          <div style="height:10px;background:#e3e6df;border-radius:999px;overflow:hidden"><div style="height:100%;width:{min(100,r.completed/x.target*100):.1f}%;background:#1f847f"></div></div>
-        </div>""", unsafe_allow_html=True)
-    if run:
-        for m in range(1,months_to_show+1):
-            render_month(m); time.sleep(delay)
-    else:
-        render_month(1)
-
-with tab3:
-    st.markdown("### What must be true to hit the deadline?")
-    st.markdown(f"To reach **{x.target:,} completed participants by month {x.target_months}** with the current assumptions:")
-    a,b,c=st.columns(3)
-    a.metric("Minimum screening rate", f"{needed_rate:.1f}" if math.isfinite(needed_rate) else "Not feasible", "per active site / month")
-    b.metric("Sites required", f"{needed_sites}" if needed_sites else "500+", f"{needed_sites-x.sites:+d} vs current plan" if needed_sites else "Outside model range")
-    if math.isfinite(needed_rate):
-        recovery = replace(x, screened_per_site=max(x.screened_per_site, needed_rate))
-        recovery_df = simulate(recovery, horizon=max(60, x.target_months + x.followup_months + 12))
-        recovery_complete = recovery_df[recovery_df.completed >= x.target - 0.01]
-        recovery_idx = int(recovery_complete.index[0]) if not recovery_complete.empty else len(recovery_df) - 1
-        budget_needed = float(recovery_df.iloc[recovery_idx].cumulative_spend)
-        c.metric("Funding needed", money(budget_needed), "At the required screening rate")
-    else:
-        c.metric("Funding needed", "Not estimable", "Deadline is shorter than follow-up")
-    if completion_month and completion_month <= x.target_months:
-        st.success(f"Current assumptions meet the deadline with approximately {x.target_months-completion_month} month(s) of schedule margin.")
-    else:
-        late=(completion_month-x.target_months) if completion_month else f"more than {60-x.target_months}"
-        st.warning(f"Current assumptions miss the desired deadline by {late} month(s). Increase recruitment capacity, activate sites faster, or revisit the target.")
-    st.markdown('<div class="note"><b>Decision insight:</b> This is a planning model, not a clinical or financial forecast. Replace illustrative assumptions with validated inputs from clinical operations, finance, regulatory and manufacturing teams.</div>',unsafe_allow_html=True)
-
-with tab4:
     st.markdown("### Ask the Clinical Trial Rescue Agent")
     st.caption(
         "The agent can inspect the current plan, call StudyRunway's simulation tools, "
@@ -635,12 +574,11 @@ with tab4:
 
     st.markdown("**Try a question**")
     suggested = [
-        "Why is the current plan at risk, and which lever should we investigate first?",
-        f"Find the lowest modeled-cost way to finish by month {x.target_months}.",
+        "Why is this trial projected to finish late?",
+        f"Find a recovery plan to finish by month {x.target_months}.",
         "What happens if recruitment falls by 50%?",
-        "Write a short leadership briefing about this scenario.",
     ]
-    suggestion_columns = st.columns(2)
+    suggestion_columns = st.columns(3)
     selected_prompt = None
     for index, suggestion in enumerate(suggested):
         if suggestion_columns[index % 2].button(
