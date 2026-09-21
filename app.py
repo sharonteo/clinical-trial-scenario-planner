@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import time
 from dataclasses import dataclass, replace
 
@@ -6,6 +8,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 
 st.set_page_config(page_title="StudyRunway", page_icon="◌", layout="wide")
@@ -141,6 +148,324 @@ def money(v):
     return f"${v/1_000_000:.1f}M" if abs(v) >= 1_000_000 else f"${v/1_000:.0f}K"
 
 
+def scenario_summary(x: Inputs) -> dict:
+    """Return auditable scenario results for the agent and the UI."""
+    horizon = max(60, x.target_months + x.followup_months + 24)
+    result = simulate(x, horizon=horizon)
+    complete = result[result.completed >= x.target - 0.01]
+    completion_month = int(complete.month.iloc[0]) if not complete.empty else None
+    completion_index = completion_month - 1 if completion_month else len(result) - 1
+    total_cost = float(result.iloc[completion_index].cumulative_spend)
+    funding_gap = max(0.0, total_cost - x.starting_cash)
+    negative_cash = result[df_column_negative(result, "cash_remaining")]
+    runout_month = int(negative_cash.month.iloc[0]) if not negative_cash.empty else None
+    return {
+        "target_completed_participants": x.target,
+        "desired_completion_month": x.target_months,
+        "projected_completion_month": completion_month,
+        "deadline_met": bool(completion_month and completion_month <= x.target_months),
+        "schedule_variance_months": (
+            completion_month - x.target_months if completion_month else None
+        ),
+        "planned_sites": x.sites,
+        "site_activation_months": x.activation_months,
+        "screened_per_active_site_per_month": round(x.screened_per_site, 3),
+        "screen_failure_rate": round(x.screen_fail, 4),
+        "dropout_rate": round(x.dropout, 4),
+        "followup_months": x.followup_months,
+        "estimated_cost": round(total_cost, 2),
+        "funding_available": round(x.starting_cash, 2),
+        "funding_gap": round(funding_gap, 2),
+        "cash_runout_month": runout_month,
+    }
+
+
+def df_column_negative(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Small helper kept separate so scenario calculations are easy to test."""
+    return frame[column] < 0
+
+
+def evaluate_agent_scenario(base: Inputs, arguments: dict) -> dict:
+    """Evaluate one bounded alternative using the trusted simulation engine."""
+    candidate = replace(
+        base,
+        sites=max(1, min(int(arguments["sites"]), 100)),
+        activation_months=max(1, min(int(arguments["activation_months"]), 36)),
+        screened_per_site=max(0.1, min(float(arguments["screened_per_site"]), 20.0)),
+        target_months=max(
+            base.followup_months + 1,
+            min(int(arguments["desired_completion_month"]), 60),
+        ),
+    )
+    return scenario_summary(candidate)
+
+
+def search_recovery_options(base: Inputs, arguments: dict) -> dict:
+    """Search a bounded grid and return the lowest modeled-cost feasible plans."""
+    deadline = max(
+        base.followup_months + 1,
+        min(int(arguments["desired_completion_month"]), 60),
+    )
+    max_extra_sites = max(0, min(int(arguments["max_extra_sites"]), 20))
+    max_screening_multiplier = max(
+        1.0, min(float(arguments["max_screening_multiplier"]), 3.0)
+    )
+    site_values = range(base.sites, base.sites + max_extra_sites + 1)
+    rate_values = np.linspace(
+        base.screened_per_site,
+        base.screened_per_site * max_screening_multiplier,
+        13,
+    )
+    feasible = []
+    for candidate_sites in site_values:
+        for candidate_rate in rate_values:
+            candidate = replace(
+                base,
+                sites=int(candidate_sites),
+                screened_per_site=float(candidate_rate),
+                target_months=deadline,
+            )
+            outcome = scenario_summary(candidate)
+            if outcome["deadline_met"] and outcome["funding_gap"] <= 0:
+                outcome["additional_sites"] = candidate_sites - base.sites
+                outcome["screening_rate_change"] = round(
+                    candidate_rate - base.screened_per_site, 3
+                )
+                feasible.append(outcome)
+
+    feasible.sort(
+        key=lambda item: (
+            item["estimated_cost"],
+            item["additional_sites"],
+            item["screening_rate_change"],
+        )
+    )
+    return {
+        "desired_completion_month": deadline,
+        "scenarios_evaluated": len(site_values) * len(rate_values),
+        "feasible_scenarios_found": len(feasible),
+        "lowest_modeled_cost_options": feasible[:5],
+        "important_limitation": (
+            "Screening-rate improvement has no separate implementation cost in this "
+            "prototype. 'Lowest modeled cost' is not necessarily the most operationally "
+            "feasible or least expensive real-world option."
+        ),
+    }
+
+
+def diagnose_trial_risk(base: Inputs) -> dict:
+    """Compare approved one-factor interventions against the current plan."""
+    baseline = scenario_summary(base)
+    baseline_month = baseline["projected_completion_month"]
+    interventions = [
+        ("Activate all planned sites 25% faster", replace(base, activation_months=max(1, math.ceil(base.activation_months * 0.75))), "site activation"),
+        ("Add two sites", replace(base, sites=min(100, base.sites + 2)), "site capacity"),
+        ("Increase screening per site by 25%", replace(base, screened_per_site=min(20.0, base.screened_per_site * 1.25)), "screening productivity"),
+        ("Reduce screen failure by 5 percentage points", replace(base, screen_fail=max(0.0, base.screen_fail - 0.05)), "screening conversion"),
+        ("Reduce dropout by 5 percentage points", replace(base, dropout=max(0.0, base.dropout - 0.05)), "participant retention"),
+    ]
+    comparisons = []
+    for label, candidate, lever in interventions:
+        outcome = scenario_summary(candidate)
+        candidate_month = outcome["projected_completion_month"]
+        months_recovered = (
+            baseline_month - candidate_month
+            if baseline_month is not None and candidate_month is not None
+            else None
+        )
+        comparisons.append({
+            "intervention": label,
+            "lever": lever,
+            "projected_completion_month": candidate_month,
+            "months_recovered": months_recovered,
+            "estimated_cost": outcome["estimated_cost"],
+            "incremental_modeled_cost": round(outcome["estimated_cost"] - baseline["estimated_cost"], 2),
+            "deadline_met": outcome["deadline_met"],
+        })
+    comparisons.sort(key=lambda item: (
+        -(item["months_recovered"] if item["months_recovered"] is not None else -999),
+        item["incremental_modeled_cost"],
+    ))
+    return {
+        "baseline": baseline,
+        "status": "on_track" if baseline["deadline_met"] else "schedule_at_risk",
+        "one_factor_intervention_comparison": comparisons,
+        "interpretation_rule": (
+            "A larger modeled improvement indicates sensitivity to that lever; it does "
+            "not prove the lever is the real-world root cause or operationally feasible."
+        ),
+        "data_scope": "Fictional planning assumptions; no patient-level data.",
+    }
+
+
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "name": "get_current_plan",
+        "description": "Read the current StudyRunway assumptions and calculated outcome.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "diagnose_trial_risk",
+        "description": (
+            "Diagnose schedule risk by comparing the current plan with approved "
+            "one-factor interventions. Use this when asked why the plan is at risk, "
+            "which levers matter most, or what should be investigated first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "evaluate_scenario",
+        "description": (
+            "Run one approved StudyRunway scenario. Use this for a specific combination "
+            "of sites, activation timing, screening rate, and deadline."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sites": {"type": "integer", "minimum": 1, "maximum": 100},
+                "activation_months": {"type": "integer", "minimum": 1, "maximum": 36},
+                "screened_per_site": {"type": "number", "minimum": 0.1, "maximum": 20},
+                "desired_completion_month": {"type": "integer", "minimum": 2, "maximum": 60},
+            },
+            "required": [
+                "sites",
+                "activation_months",
+                "screened_per_site",
+                "desired_completion_month",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "search_recovery_options",
+        "description": (
+            "Search bounded combinations of added sites and higher screening rates, then "
+            "return feasible options ranked by modeled cost."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "desired_completion_month": {"type": "integer", "minimum": 2, "maximum": 60},
+                "max_extra_sites": {"type": "integer", "minimum": 0, "maximum": 20},
+                "max_screening_multiplier": {"type": "number", "minimum": 1, "maximum": 3},
+            },
+            "required": [
+                "desired_completion_month",
+                "max_extra_sites",
+                "max_screening_multiplier",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+
+AGENT_INSTRUCTIONS = """
+You are StudyRunway's Trial Risk Agent. You support scenario exploration for a
+fictional clinical-trial planning prototype.
+
+Rules:
+- Use a tool before stating any number about cost, funding, sites, or timing.
+- Never perform arithmetic projections yourself and never invent a result.
+- When asked why a plan is at risk or which lever matters most, call
+  diagnose_trial_risk and describe the result as sensitivity analysis, not
+  proof of root cause.
+- When asked to recommend a recovery plan, call search_recovery_options.
+- Say "lowest modeled cost" rather than "cheapest" and repeat the returned
+  limitation about unpriced operational effort.
+- Clearly distinguish assumptions, simulation results, and recommendations for
+  human consideration.
+- Do not make clinical, regulatory, investment, patient-selection, or patient-
+  recruitment decisions.
+- Do not request or accept protected health information or identifiable patient data.
+- Keep answers concise, use plain language, and mention that the data are fictional.
+"""
+
+
+def run_trial_risk_agent(
+    client, model: str, base: Inputs, messages: list[dict]
+) -> tuple[str, list[str]]:
+    """Run a short, bounded function-calling loop."""
+    trace = []
+    input_items = [
+        {"role": item["role"], "content": item["content"]}
+        for item in messages[-8:]
+    ]
+    for _ in range(4):
+        response = client.responses.create(
+            model=model,
+            instructions=AGENT_INSTRUCTIONS,
+            tools=AGENT_TOOLS,
+            input=input_items,
+        )
+        input_items += response.output
+        calls = [item for item in response.output if item.type == "function_call"]
+        if not calls:
+            answer = response.output_text or "I could not produce an answer from the available tools."
+            return answer, trace
+
+        for call in calls:
+            args = json.loads(call.arguments or "{}")
+            if call.name == "get_current_plan":
+                result = scenario_summary(base)
+                trace.append("Read the current StudyRunway plan and calculated outcome.")
+            elif call.name == "diagnose_trial_risk":
+                result = diagnose_trial_risk(base)
+                trace.append(
+                    "Compared five approved one-factor interventions against the "
+                    "current plan using StudyRunway's simulation engine."
+                )
+            elif call.name == "evaluate_scenario":
+                result = evaluate_agent_scenario(base, args)
+                trace.append(
+                    "Simulated a plan with "
+                    f"{args['sites']} sites, {args['screened_per_site']:g} screened per "
+                    f"site/month and a month-{args['desired_completion_month']} deadline."
+                )
+            elif call.name == "search_recovery_options":
+                result = search_recovery_options(base, args)
+                trace.append(
+                    f"Evaluated {result['scenarios_evaluated']} bounded recovery scenarios "
+                    f"and found {result['feasible_scenarios_found']} that met the modeled constraints."
+                )
+            else:
+                result = {"error": "Tool not allowed."}
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": json.dumps(result),
+                }
+            )
+    return "I reached the scenario-analysis limit. Please ask a narrower question.", trace
+
+
+def app_secret(name: str, default=None):
+    """Read a Streamlit secret, with an environment-variable fallback for local use."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
+
+
 with st.sidebar:
     st.markdown("### Trial assumptions")
     st.caption("Adjust the plan. All figures are illustrative.")
@@ -156,7 +481,7 @@ with st.sidebar:
     patient_cost = st.number_input("Cost per enrolled participant", 5_000, 150_000, 35_000, 1_000)
     fixed_monthly = st.number_input("Fixed monthly program cost", 50_000, 2_000_000, 350_000, 25_000)
     starting_cash = st.number_input("Funding available", 1_000_000, 100_000_000, 25_000_000, 500_000)
-    target_months = st.slider("Desired completion deadline (months)", 6, 48, 24)
+    target_months = st.slider("Desired completion deadline (months)", 6, 48, 14)
 
 x = Inputs(target, sites, activation_months, screened_rate, screen_fail, dropout, followup_months,
            startup_cost, patient_cost, fixed_monthly, starting_cash, target_months)
@@ -189,7 +514,9 @@ for col, (label,value,sub) in zip(cols,cards):
     col.markdown(f'<div class="metric"><div class="label">{label}</div><div class="value">{value}</div><div class="sub">{sub}</div></div>', unsafe_allow_html=True)
 
 st.markdown("## Explore the forecast")
-tab1, tab2, tab3 = st.tabs(["Forecast", "Monthly progression", "Meet the target"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Forecast", "Monthly progression", "Meet the target", "Clinical Trial Rescue Agent"]
+)
 
 with tab1:
     left, right = st.columns([1.55,1])
@@ -262,5 +589,124 @@ with tab3:
         st.warning(f"Current assumptions miss the desired deadline by {late} month(s). Increase recruitment capacity, activate sites faster, or revisit the target.")
     st.markdown('<div class="note"><b>Decision insight:</b> This is a planning model, not a clinical or financial forecast. Replace illustrative assumptions with validated inputs from clinical operations, finance, regulatory and manufacturing teams.</div>',unsafe_allow_html=True)
 
-st.markdown("""<div class="footer"><b>StudyRunway</b> · Clinical Trial Scenario Planner · Generic demonstration using fictional assumptions. Not affiliated with any sponsor, medicine or clinical study. Not medical, regulatory or investment advice.</div>""",unsafe_allow_html=True)
+with tab4:
+    st.markdown("### Ask the Clinical Trial Rescue Agent")
+    st.caption(
+        "The agent can inspect the current plan, call StudyRunway's simulation tools, "
+        "test bounded recovery scenarios and explain the results."
+    )
+    st.markdown(
+        '<div class="note"><b>Human oversight:</b> The agent explores fictional '
+        'planning scenarios. It does not make clinical, regulatory, financial or '
+        'patient-level decisions.</div>',
+        unsafe_allow_html=True,
+    )
 
+    scenario_signature = repr(x)
+    if st.session_state.get("agent_scenario_signature") != scenario_signature:
+        st.session_state.agent_scenario_signature = scenario_signature
+        st.session_state.agent_messages = []
+        st.session_state.agent_requests = 0
+
+    if "agent_messages" not in st.session_state:
+        st.session_state.agent_messages = []
+    if "agent_requests" not in st.session_state:
+        st.session_state.agent_requests = 0
+
+    top_left, top_right = st.columns([4, 1])
+    with top_left:
+        st.caption(
+            f"Current scenario: {x.sites} sites · {x.screened_per_site:g} screened per "
+            f"site/month · completion deadline month {x.target_months}"
+        )
+    with top_right:
+        if st.button("Clear conversation", key="clear_agent_chat"):
+            st.session_state.agent_messages = []
+            st.session_state.agent_requests = 0
+            st.rerun()
+
+    for message in st.session_state.agent_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message.get("trace"):
+                with st.expander("Agent actions"):
+                    for action in message["trace"]:
+                        st.markdown(f"- {action}")
+
+    st.markdown("**Try a question**")
+    suggested = [
+        "Why is the current plan at risk, and which lever should we investigate first?",
+        f"Find the lowest modeled-cost way to finish by month {x.target_months}.",
+        "What happens if recruitment falls by 50%?",
+        "Write a short leadership briefing about this scenario.",
+    ]
+    suggestion_columns = st.columns(2)
+    selected_prompt = None
+    for index, suggestion in enumerate(suggested):
+        if suggestion_columns[index % 2].button(
+            suggestion, key=f"agent_suggestion_{index}", use_container_width=True
+        ):
+            selected_prompt = suggestion
+
+    typed_prompt = st.chat_input(
+        "Ask about enrollment, sites, timing or funding…",
+        key="trial_risk_agent_input",
+        max_chars=600,
+    )
+    prompt = selected_prompt or typed_prompt
+
+    if prompt:
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        st.session_state.agent_messages.append({"role": "user", "content": prompt})
+
+        api_key = app_secret("OPENAI_API_KEY")
+        model = app_secret("OPENAI_MODEL", "gpt-5.6-luna")
+        if OpenAI is None:
+            answer = (
+                "The OpenAI Python package is not installed. Add `openai>=2.0.0` "
+                "to `requirements.txt`, redeploy, and try again."
+            )
+            trace = []
+        elif not api_key:
+            answer = (
+                "The agent is not configured yet. Add `OPENAI_API_KEY` to Streamlit "
+                "Secrets; do not place the key in this file or commit it to GitHub."
+            )
+            trace = []
+        elif st.session_state.agent_requests >= 8:
+            answer = (
+                "This demo's eight-request session limit has been reached. Clear the "
+                "conversation to begin a new demonstration."
+            )
+            trace = []
+        else:
+            try:
+                with st.spinner("Testing the scenario with StudyRunway…"):
+                    client = OpenAI(api_key=api_key, timeout=30.0, max_retries=1)
+                    answer, trace = run_trial_risk_agent(
+                        client,
+                        str(model),
+                        x,
+                        st.session_state.agent_messages,
+                    )
+                st.session_state.agent_requests += 1
+            except Exception as exc:
+                trace = []
+                answer = (
+                    "I couldn't complete the scenario analysis. Confirm the API key, "
+                    "model access and account limits, then try again. "
+                    f"Technical detail: `{type(exc).__name__}`."
+                )
+
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+            if trace:
+                with st.expander("Agent actions"):
+                    for action in trace:
+                        st.markdown(f"- {action}")
+        st.session_state.agent_messages.append(
+            {"role": "assistant", "content": answer, "trace": trace}
+        )
+
+st.markdown("""<div class="footer"><b>StudyRunway</b> · Clinical Trial Scenario Planner · Generic demonstration using fictional assumptions. Not affiliated with any sponsor, medicine or clinical study. Not medical, regulatory or investment advice.</div>""",unsafe_allow_html=True)
