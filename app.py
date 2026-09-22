@@ -42,6 +42,16 @@ p,div,label { font-family:DM Sans,sans-serif; }
 div[data-testid="stMetric"] {background:white;border:1px solid #e2e3dd;padding:1rem;border-radius:16px}
 .stButton button {border-radius:999px;border:0;background:#1f847f;color:white;font-weight:700;padding:.55rem 1.3rem}
 .stButton button:hover {background:#176d68;color:white;border:0}
+.agent-intro {background:rgba(255,255,255,.72);border:1px solid #e2e3dd;border-radius:18px;
+ padding:1.15rem 1.3rem;margin:.25rem 0 1rem}
+.agent-intro h3 {margin:0 0 .25rem;font-size:1.35rem}
+.agent-intro p {margin:0;color:var(--muted);font-size:.92rem}
+.scenario-strip {display:flex;gap:1.6rem;align-items:center;background:#e9f3f0;
+ border-radius:14px;padding:.8rem 1rem;margin:0 0 1rem;color:#29434b;font-size:.86rem}
+.scenario-strip strong {display:block;color:var(--ink);font:700 1.05rem Manrope,sans-serif}
+.scenario-strip span {min-width:105px}
+div[data-testid="stChatMessage"] {background:rgba(255,255,255,.72);border:1px solid #e5e4de;
+ border-radius:16px;padding:.35rem .55rem;margin-bottom:.65rem}
 </style>
 """, unsafe_allow_html=True)
 
@@ -529,15 +539,22 @@ with tab1:
     st.markdown('<div class="note"><b>Planning note:</b> Results use fictional assumptions. Replace them with validated clinical-operations and finance inputs before making decisions.</div>', unsafe_allow_html=True)
 
 with tab2:
-    st.markdown("### Ask the Clinical Trial Rescue Agent")
-    st.caption(
-        "The agent can inspect the current plan, call StudyRunway's simulation tools, "
-        "test bounded recovery scenarios and explain the results."
-    )
     st.markdown(
-        '<div class="note"><b>Human oversight:</b> The agent explores fictional '
-        'planning scenarios. It does not make clinical, regulatory, financial or '
-        'patient-level decisions.</div>',
+        '<div class="agent-intro"><h3>AI Trial Rescue Agent</h3>'
+        '<p>Ask what is driving the delay or test a recovery plan.</p></div>',
+        unsafe_allow_html=True,
+    )
+
+    variance = completion_month - x.target_months if completion_month else None
+    variance_text = f"{variance} months late" if variance and variance > 0 else "On schedule"
+    st.markdown(
+        f'<div class="scenario-strip">'
+        f'<span><strong>{x.sites}</strong>sites</span>'
+        f'<span><strong>{x.screened_per_site:g}</strong>screened/site/month</span>'
+        f'<span><strong>Month {completion_month or "60+"}</strong>forecast</span>'
+        f'<span><strong>Month {x.target_months}</strong>deadline</span>'
+        f'<span><strong>{variance_text}</strong>status</span>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
@@ -552,42 +569,38 @@ with tab2:
     if "agent_requests" not in st.session_state:
         st.session_state.agent_requests = 0
 
-    top_left, top_right = st.columns([4, 1])
-    with top_left:
-        st.caption(
-            f"Current scenario: {x.sites} sites · {x.screened_per_site:g} screened per "
-            f"site/month · completion deadline month {x.target_months}"
-        )
-    with top_right:
-        if st.button("Clear conversation", key="clear_agent_chat"):
-            st.session_state.agent_messages = []
-            st.session_state.agent_requests = 0
-            st.rerun()
+    if st.session_state.agent_messages:
+        _, top_right = st.columns([5, 1])
+        with top_right:
+            if st.button("Clear", key="clear_agent_chat", use_container_width=True):
+                st.session_state.agent_messages = []
+                st.session_state.agent_requests = 0
+                st.rerun()
 
     for message in st.session_state.agent_messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("trace"):
-                with st.expander("Agent actions"):
+                with st.expander("How the agent reached this answer"):
                     for action in message["trace"]:
                         st.markdown(f"- {action}")
 
-    st.markdown("**Try a question**")
-    suggested = [
-        "Why is this trial projected to finish late?",
-        f"Find a recovery plan to finish by month {x.target_months}.",
-        "What happens if recruitment falls by 50%?",
-    ]
-    suggestion_columns = st.columns(3)
     selected_prompt = None
-    for index, suggestion in enumerate(suggested):
-        if suggestion_columns[index % 2].button(
-            suggestion, key=f"agent_suggestion_{index}", use_container_width=True
-        ):
-            selected_prompt = suggestion
+    if not st.session_state.agent_messages:
+        st.caption("START WITH A QUESTION")
+        suggested = [
+            "Why is this trial projected to finish late?",
+            f"Find a recovery plan to finish by month {x.target_months}.",
+        ]
+        suggestion_columns = st.columns(2)
+        for index, suggestion in enumerate(suggested):
+            if suggestion_columns[index].button(
+                suggestion, key=f"agent_suggestion_{index}", use_container_width=True
+            ):
+                selected_prompt = suggestion
 
     typed_prompt = st.chat_input(
-        "Ask about enrollment, sites, timing or funding…",
+        "Ask about the delay or test a recovery plan…",
         key="trial_risk_agent_input",
         max_chars=600,
     )
@@ -640,11 +653,18 @@ with tab2:
         with st.chat_message("assistant"):
             st.markdown(answer)
             if trace:
-                with st.expander("Agent actions"):
+                with st.expander("How the agent reached this answer"):
                     for action in trace:
                         st.markdown(f"- {action}")
         st.session_state.agent_messages.append(
             {"role": "assistant", "content": answer, "trace": trace}
+        )
+
+    with st.expander("About this demo"):
+        st.caption(
+            "The agent uses StudyRunway's simulation tools and fictional assumptions. "
+            "It supports human review and does not make clinical, regulatory, financial "
+            "or patient-level decisions."
         )
 
 st.markdown("""<div class="footer"><b>StudyRunway</b> · Clinical Trial Scenario Planner · Generic demonstration using fictional assumptions. Not affiliated with any sponsor, medicine or clinical study. Not medical, regulatory or investment advice.</div>""",unsafe_allow_html=True)
