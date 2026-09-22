@@ -211,14 +211,14 @@ def evaluate_agent_scenario(base: Inputs, arguments: dict) -> dict:
 
 
 def search_recovery_options(base: Inputs, arguments: dict) -> dict:
-    """Search a bounded grid and return the lowest modeled-cost feasible plans."""
+    """Search realistic combinations and rank plans by the smallest overall change."""
     deadline = max(
         base.followup_months + 1,
         min(int(arguments["desired_completion_month"]), 60),
     )
-    max_extra_sites = max(0, min(int(arguments["max_extra_sites"]), 20))
+    max_extra_sites = max(0, min(int(arguments["max_extra_sites"]), 10))
     max_screening_multiplier = max(
-        1.0, min(float(arguments["max_screening_multiplier"]), 3.0)
+        1.0, min(float(arguments["max_screening_multiplier"]), 1.5)
     )
     site_values = range(base.sites, base.sites + max_extra_sites + 1)
     rate_values = np.linspace(
@@ -241,24 +241,33 @@ def search_recovery_options(base: Inputs, arguments: dict) -> dict:
                 outcome["screening_rate_change"] = round(
                     candidate_rate - base.screened_per_site, 3
                 )
+                outcome["change_score"] = round(
+                    outcome["additional_sites"] / max(base.sites, 1)
+                    + outcome["screening_rate_change"]
+                    / max(base.screened_per_site, 0.1),
+                    4,
+                )
                 feasible.append(outcome)
 
     feasible.sort(
         key=lambda item: (
+            item["change_score"],
+            abs(item["projected_completion_month"] - deadline),
             item["estimated_cost"],
-            item["additional_sites"],
-            item["screening_rate_change"],
         )
     )
     return {
         "desired_completion_month": deadline,
         "scenarios_evaluated": len(site_values) * len(rate_values),
         "feasible_scenarios_found": len(feasible),
-        "lowest_modeled_cost_options": feasible[:5],
+        "recommended_options": feasible[:5],
+        "ranking_method": (
+            "Smallest combined percentage change in site count and screening rate, "
+            "then closest to the deadline, then estimated cost."
+        ),
         "important_limitation": (
-            "Screening-rate improvement has no separate implementation cost in this "
-            "prototype. 'Lowest modeled cost' is not necessarily the most operationally "
-            "feasible or least expensive real-world option."
+            "The model does not include the implementation cost of increasing the "
+            "screening rate. The study team must decide what is realistic."
         ),
     }
 
@@ -270,7 +279,7 @@ def diagnose_trial_risk(base: Inputs) -> dict:
     interventions = [
         ("Activate all planned sites 25% faster", replace(base, activation_months=max(1, math.ceil(base.activation_months * 0.75))), "site activation"),
         ("Add two sites", replace(base, sites=min(100, base.sites + 2)), "site capacity"),
-        ("Increase screening per site by 25%", replace(base, screened_per_site=min(20.0, base.screened_per_site * 1.25)), "screening productivity"),
+        ("Increase screening per site by 25%", replace(base, screened_per_site=min(20.0, base.screened_per_site * 1.25)), "screening rate"),
         ("Reduce screen failure by 5 percentage points", replace(base, screen_fail=max(0.0, base.screen_fail - 0.05)), "screening conversion"),
         ("Reduce dropout by 5 percentage points", replace(base, dropout=max(0.0, base.dropout - 0.05)), "participant retention"),
     ]
@@ -301,8 +310,8 @@ def diagnose_trial_risk(base: Inputs) -> dict:
         "status": "on_track" if baseline["deadline_met"] else "schedule_at_risk",
         "one_factor_intervention_comparison": comparisons,
         "interpretation_rule": (
-            "A larger modeled improvement indicates sensitivity to that lever; it does "
-            "not prove the lever is the real-world root cause or operationally feasible."
+            "A larger improvement shows which change helped most in the simulation. "
+            "It does not prove the real-world cause."
         ),
         "data_scope": "Fictional planning assumptions; no patient-level data.",
     }
@@ -366,15 +375,15 @@ AGENT_TOOLS = [
         "type": "function",
         "name": "search_recovery_options",
         "description": (
-            "Search bounded combinations of added sites and higher screening rates, then "
-            "return feasible options ranked by modeled cost."
+            "Test realistic combinations of added sites and higher screening rates, then "
+            "return options ranked by the smallest overall change needed."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "desired_completion_month": {"type": "integer", "minimum": 2, "maximum": 60},
-                "max_extra_sites": {"type": "integer", "minimum": 0, "maximum": 20},
-                "max_screening_multiplier": {"type": "number", "minimum": 1, "maximum": 3},
+                "max_extra_sites": {"type": "integer", "minimum": 0, "maximum": 10},
+                "max_screening_multiplier": {"type": "number", "minimum": 1, "maximum": 1.5},
             },
             "required": [
                 "desired_completion_month",
@@ -396,11 +405,11 @@ Rules:
 - Use a tool before stating any number about cost, funding, sites, or timing.
 - Never perform arithmetic projections yourself and never invent a result.
 - When asked why a plan is at risk or which lever matters most, call
-  diagnose_trial_risk and describe the result as sensitivity analysis, not
-  proof of root cause.
+  diagnose_trial_risk and explain what changed in the simulation. Do not claim
+  that the simulation proves the real-world cause.
 - When asked to recommend a recovery plan, call search_recovery_options.
-- Say "lowest modeled cost" rather than "cheapest" and repeat the returned
-  limitation about unpriced operational effort.
+- Use the first recommended option returned by the recovery search and repeat
+  its short limitation.
 - Clearly distinguish assumptions, simulation results, and recommendations for
   human consideration.
 - Do not make clinical, regulatory, investment, patient-selection, or patient-
@@ -414,6 +423,9 @@ Rules:
   intervention," "root cause," and "operational feasibility." Use ordinary phrases
   such as "the model tested," "the biggest improvement," and "the study team must
   decide what is realistic."
+- Say "screening rate," never "screening productivity."
+- Write money as "USD 21.78 million". Never use a dollar sign because it may be
+  misread as a formatting symbol.
 """
 
 
