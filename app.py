@@ -221,10 +221,11 @@ def search_recovery_options(base: Inputs, arguments: dict) -> dict:
         1.0, min(float(arguments["max_screening_multiplier"]), 1.5)
     )
     site_values = range(base.sites, base.sites + max_extra_sites + 1)
-    rate_values = np.linspace(
+    maximum_rate = base.screened_per_site * max_screening_multiplier
+    rate_values = np.arange(
         base.screened_per_site,
-        base.screened_per_site * max_screening_multiplier,
-        13,
+        maximum_rate + 0.001,
+        0.25,
     )
     feasible = []
     for candidate_sites in site_values:
@@ -410,8 +411,11 @@ Rules:
 - When asked to recommend a recovery plan, call search_recovery_options.
 - Use the first recommended option returned by the recovery search and repeat
   its short limitation.
+- Begin a recovery answer with the exact heading "**Recommended recovery plan:**".
+- Never say "recommended for human consideration." End by saying the study team
+  must confirm that the changes are realistic.
 - Clearly distinguish assumptions, simulation results, and recommendations for
-  human consideration.
+  human review.
 - Do not make clinical, regulatory, investment, patient-selection, or patient-
   recruitment decisions.
 - Do not request or accept protected health information or identifiable patient data.
@@ -424,6 +428,7 @@ Rules:
   such as "the model tested," "the biggest improvement," and "the study team must
   decide what is realistic."
 - Say "screening rate," never "screening productivity."
+- Round the screening rate to no more than two decimal places.
 - Write money as "USD 21.78 million". Never use a dollar sign because it may be
   misread as a formatting symbol.
 """
