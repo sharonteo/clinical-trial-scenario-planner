@@ -14,7 +14,12 @@ except ImportError:
     OpenAI = None
 
 
-st.set_page_config(page_title="StudyRunway", page_icon="◌", layout="wide")
+st.set_page_config(
+    page_title="StudyRunway",
+    page_icon="◌",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 st.markdown("""
 <style>
@@ -42,14 +47,9 @@ p,div,label { font-family:DM Sans,sans-serif; }
 div[data-testid="stMetric"] {background:white;border:1px solid #e2e3dd;padding:1rem;border-radius:16px}
 .stButton button {border-radius:999px;border:0;background:#1f847f;color:white;font-weight:700;padding:.55rem 1.3rem}
 .stButton button:hover {background:#176d68;color:white;border:0}
-.agent-intro {background:rgba(255,255,255,.72);border:1px solid #e2e3dd;border-radius:18px;
- padding:1.15rem 1.3rem;margin:.25rem 0 1rem}
-.agent-intro h3 {margin:0 0 .25rem;font-size:1.35rem}
-.agent-intro p {margin:0;color:var(--muted);font-size:.92rem}
-.scenario-strip {display:flex;gap:1.6rem;align-items:center;background:#e9f3f0;
- border-radius:14px;padding:.8rem 1rem;margin:0 0 1rem;color:#29434b;font-size:.86rem}
-.scenario-strip strong {display:block;color:var(--ink);font:700 1.05rem Manrope,sans-serif}
-.scenario-strip span {min-width:105px}
+.agent-status {background:#e9f3f0;border-left:4px solid var(--teal);border-radius:10px;
+ padding:.8rem 1rem;margin:.35rem 0 1.15rem;color:#29434b;font-size:.95rem}
+.agent-status strong {color:var(--ink)}
 div[data-testid="stChatMessage"] {background:rgba(255,255,255,.72);border:1px solid #e5e4de;
  border-radius:16px;padding:.35rem .55rem;margin-bottom:.65rem}
 </style>
@@ -539,22 +539,22 @@ with tab1:
     st.markdown('<div class="note"><b>Planning note:</b> Results use fictional assumptions. Replace them with validated clinical-operations and finance inputs before making decisions.</div>', unsafe_allow_html=True)
 
 with tab2:
-    st.markdown(
-        '<div class="agent-intro"><h3>AI Trial Rescue Agent</h3>'
-        '<p>Ask what is driving the delay or test a recovery plan.</p></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown("### AI Trial Rescue Agent")
+    st.caption("Ask what is driving the delay or test a recovery plan.")
 
     variance = completion_month - x.target_months if completion_month else None
-    variance_text = f"{variance} months late" if variance and variance > 0 else "On schedule"
+    if variance and variance > 0:
+        status_text = (
+            f"Current forecast: <strong>Month {completion_month}</strong> — "
+            f"{variance} months behind the Month {x.target_months} deadline."
+        )
+    else:
+        status_text = (
+            f"Current forecast: <strong>Month {completion_month or '60+'}</strong> — "
+            f"on schedule for the Month {x.target_months} deadline."
+        )
     st.markdown(
-        f'<div class="scenario-strip">'
-        f'<span><strong>{x.sites}</strong>sites</span>'
-        f'<span><strong>{x.screened_per_site:g}</strong>screened/site/month</span>'
-        f'<span><strong>Month {completion_month or "60+"}</strong>forecast</span>'
-        f'<span><strong>Month {x.target_months}</strong>deadline</span>'
-        f'<span><strong>{variance_text}</strong>status</span>'
-        f'</div>',
+        f'<div class="agent-status">{status_text}</div>',
         unsafe_allow_html=True,
     )
 
