@@ -35,7 +35,8 @@ p,div,label { font-family:DM Sans,sans-serif; }
 .eyebrow {font-weight:700;letter-spacing:.12em;text-transform:uppercase;font-size:.75rem;color:#bfe4df;margin-bottom:.8rem}
 .hero h1 {font-size:3rem;line-height:1.05;color:white !important;max-width:800px;margin:.2rem 0 1rem}
 .hero p {font-size:1.08rem;max-width:740px;color:#dbe8e6;margin:0}
-.metric {background:rgba(255,255,255,.72);border:1px solid #dedfd8;border-radius:18px;padding:1.1rem 1.2rem;min-height:112px}
+.metric {background:rgba(255,255,255,.72);border:1px solid #dedfd8;border-radius:18px;
+ padding:1.1rem 1.2rem;height:170px;box-sizing:border-box}
 .metric .label {color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;font-weight:700}
 .metric .value {font:700 1.65rem Manrope;color:var(--ink);margin:.35rem 0}.metric .sub {font-size:.82rem;color:var(--muted)}
 .status {display:inline-block;padding:.35rem .75rem;border-radius:999px;font-weight:700;font-size:.78rem;background:#dcefeb;color:#17655f}
@@ -405,7 +406,14 @@ Rules:
 - Do not make clinical, regulatory, investment, patient-selection, or patient-
   recruitment decisions.
 - Do not request or accept protected health information or identifiable patient data.
-- Keep answers concise, use plain language, and mention that the data are fictional.
+- Write for a general business audience, not a statistician.
+- Keep the answer under 120 words and use no more than three short bullets.
+- Lead with the direct answer. Then explain the most important change and what it
+  could improve. End with one short sentence saying the results use fictional data.
+- Avoid jargon such as "sensitivity analysis," "modeled lever," "one-factor
+  intervention," "root cause," and "operational feasibility." Use ordinary phrases
+  such as "the model tested," "the biggest improvement," and "the study team must
+  decide what is realistic."
 """
 
 
@@ -439,8 +447,7 @@ def run_trial_risk_agent(
             elif call.name == "diagnose_trial_risk":
                 result = diagnose_trial_risk(base)
                 trace.append(
-                    "Compared five approved one-factor interventions against the "
-                    "current plan using StudyRunway's simulation engine."
+                    "Tested five possible changes using the StudyRunway simulation."
                 )
             elif call.name == "evaluate_scenario":
                 result = evaluate_agent_scenario(base, args)
@@ -452,8 +459,8 @@ def run_trial_risk_agent(
             elif call.name == "search_recovery_options":
                 result = search_recovery_options(base, args)
                 trace.append(
-                    f"Evaluated {result['scenarios_evaluated']} bounded recovery scenarios "
-                    f"and found {result['feasible_scenarios_found']} that met the modeled constraints."
+                    f"Tested {result['scenarios_evaluated']} recovery plans and found "
+                    f"{result['feasible_scenarios_found']} that reached the deadline."
                 )
             else:
                 result = {"error": "Tool not allowed."}
@@ -519,7 +526,6 @@ cards = [
 for col, (label,value,sub) in zip(cols,cards):
     col.markdown(f'<div class="metric"><div class="label">{label}</div><div class="value">{value}</div><div class="sub">{sub}</div></div>', unsafe_allow_html=True)
 
-st.markdown("## Trial decision support")
 tab1, tab2 = st.tabs(["Trial Outlook", "AI Rescue Agent"])
 
 with tab1:
@@ -581,7 +587,7 @@ with tab2:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("trace"):
-                with st.expander("How the agent reached this answer"):
+                with st.expander("What the agent tested"):
                     for action in message["trace"]:
                         st.markdown(f"- {action}")
 
@@ -653,12 +659,13 @@ with tab2:
         with st.chat_message("assistant"):
             st.markdown(answer)
             if trace:
-                with st.expander("How the agent reached this answer"):
+                with st.expander("What the agent tested"):
                     for action in trace:
                         st.markdown(f"- {action}")
         st.session_state.agent_messages.append(
             {"role": "assistant", "content": answer, "trace": trace}
         )
+        st.rerun()
 
     with st.expander("About this demo"):
         st.caption(
